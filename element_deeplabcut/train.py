@@ -79,6 +79,7 @@ def get_dlc_root_data_dir() -> list:
 
     return root_directories
 
+
 def get_dlc_processed_data_dir() -> str:
     """
     If specified by the user, this function provides DeepLabCut with an output
@@ -95,6 +96,7 @@ def get_dlc_processed_data_dir() -> str:
         return get_dlc_root_data_dir()[0]
 
 # ----------------------------- Table declarations ----------------------
+
 
 @schema
 class VideoSet(dj.Manual):
@@ -160,8 +162,8 @@ class TrainingParamSet(dj.Lookup):
 
         if param_query:  # If the specified param-set already exists
             existing_paramset_idx = param_query.fetch1('paramset_idx')
-            if existing_paramset_idx == int(paramset_idx): # If existing_idx same:
-                return                                     # job done
+            if existing_paramset_idx == int(paramset_idx):  # If existing_idx same:
+                return                                      # job done
             else:  # If not: human error, adding paramset w/new name
                 raise dj.DataJointError(
                     f'The specified param-set already exists'
