@@ -300,9 +300,10 @@ class Model(dj.Manual):
             return
         with cls.connection.transaction:
             cls.insert1(model_dict)
-            # 'not None' bc, when should execute, returns list w/ambiguous truth val
-            if BodyPart.extract_new_body_parts(dlc_config, verbose=False) is not None:
+            # Returns array, so check size for unambiguous truth value
+            if len(BodyPart.extract_new_body_parts(dlc_config, verbose=False)):
                 BodyPart.insert_from_config(dlc_config, prompt=prompt)
+            cls.BodyPart.insert((model_name, bp) for bp in dlc_config['bodyparts'])
 
 
 @schema
@@ -436,7 +437,6 @@ class PoseEstimation(dj.Computed):
         definition = """ # uses DeepLabCut h5 output for body part position
         -> master
         -> Model.BodyPart
-
         ---
         frame_index : longblob     # frame index in model
         x_pos       : longblob
