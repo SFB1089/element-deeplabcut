@@ -42,6 +42,7 @@ def activate(
     Dependencies:
     Upstream tables:
         Session: A parent table to VideoRecording, identifying a recording session.
+        Scan: A parent table to VideoRecording, identifying a recording scan.
         Equipment: A parent table to VideoRecording, identifying a recording device.
     Functions:
         get_dlc_root_data_dir(): Returns absolute path for root data director(y/ies)
@@ -144,6 +145,39 @@ class VideoRecording(dj.Manual):
         file_path: varchar(255)  # filepath of video, relative to root data directory
         """
 
+@schema
+class VideoRecordingNew(dj.Manual):
+    """Set of video recordings for DLC inferences.
+
+    Attributes:
+        Session (foreign key): Session primary key (inherited via scan.Scan)
+        Scan (foreign key): Scan primary key.
+        recording_id (vartchar(44)): Unique recording ID. Construct from scan_id and Camera
+        Device (foreign key): Device table primary key, used for default output
+            directory path information.
+    """
+
+    definition = """
+    -> Scan
+    recording_id: varchar(44) 
+    ---
+    -> equipment.Device
+    """
+
+    class File(dj.Part):
+        """File IDs and paths associated with a given recording_id
+
+        Attributes:
+            VideoRecordingNew (foreign key): Video recording primary key.
+            file_path ( varchar(255) ): file path of video, relative to root data dir.
+        """
+
+        definition = """
+        -> master
+        file_id: int
+        ---
+        file_path: varchar(255)  # filepath of video, relative to root data directory
+        """
 
 @schema
 class RecordingInfo(dj.Imported):
@@ -177,6 +211,69 @@ class RecordingInfo(dj.Imported):
     def make(self, key):
         """Populates table with video metadata using CV2."""
         file_paths = (VideoRecording.File & key).fetch("file_path")
+
+        nframes = 0
+        px_height, px_width, fps = None, None, None
+
+        for file_path in file_paths:
+            file_path = (find_full_path(get_dlc_root_data_dir(), file_path)).as_posix()
+
+            cap = cv2.VideoCapture(file_path)
+            info = (
+                int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+                int(cap.get(cv2.CAP_PROP_FPS)),
+            )
+            if px_height is not None:
+                assert (px_height, px_width, fps) == info
+            px_height, px_width, fps = info
+            nframes += int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+
+        self.insert1(
+            {
+                **key,
+                "px_height": px_height,
+                "px_width": px_width,
+                "nframes": nframes,
+                "fps": fps,
+                "recording_duration": nframes / fps,
+            }
+        )
+
+
+@schema
+class RecordingInfoNew(dj.Imported):
+    """Automated table with video file metadata.
+
+    Attributes:
+        VideoRecordingNew (foreign key): Video recording key.
+        px_height (smallint): Height in pixels.
+        px_width (smallint): Width in pixels.
+        nframes (int): Number of frames.
+        fps (int): Optional. Frames per second, Hz.
+        recording_datetime (datetime): Optional. Datetime for the start of recording.
+        recording_duration (float): video duration (s) from nframes / fps."""
+
+    definition = """
+    -> VideoRecordingNew
+    ---
+    px_height                 : smallint  # height in pixels
+    px_width                  : smallint  # width in pixels
+    nframes                   : int  # number of frames 
+    fps = NULL                : int       # (Hz) frames per second
+    recording_datetime = NULL : datetime  # Datetime for the start of the recording
+    recording_duration        : float     # video duration (s) from nframes / fps
+    """
+
+    @property
+    def key_source(self):
+        """Defines order of keys for make function when called via `populate()`"""
+        return VideoRecordingNew & VideoRecordingNew.File
+
+    def make(self, key):
+        """Populates table with video metadata using CV2."""
+        file_paths = (VideoRecordingNew.File & key).fetch("file_path")
 
         nframes = 0
         px_height, px_width, fps = None, None, None
@@ -631,7 +728,123 @@ class PoseEstimationTask(dj.Manual):
         """
         processed_dir = get_dlc_processed_data_dir()
         output_dir = cls.infer_output_dir(
-            {**video_recording_key, "model_name": model_name}, relative=False, mkdir=True
+            {**video_recording_key, "model_name": model_name},
+            relative=False,
+            mkdir=True,
+        )
+
+        if task_mode is None:
+            try:
+                _ = dlc_reader.PoseEstimation(output_dir)
+            except FileNotFoundError:
+                task_mode = "trigger"
+            else:
+                task_mode = "load"
+
+        cls.insert1(
+            {
+                **video_recording_key,
+                "model_name": model_name,
+                "task_mode": task_mode,
+                "pose_estimation_params": analyze_videos_params,
+                "pose_estimation_output_dir": output_dir.as_posix(), #TR23: defaulting to outputdir
+                # "pose_estimation_output_dir": output_dir.relative_to(
+                #     processed_dir
+                # ).as_posix(),
+            }, skip_duplicates=True #TR23
+        )
+
+    insert_estimation_task = generate
+
+@schema
+class PoseEstimationTaskNew(dj.Manual):
+    """Staging table for pairing of video recording and model before inference.
+
+    Attributes:
+        VideoRecordingNew (foreign key): Video recording key.
+        Model (foreign key): Model name.
+        task_mode (load or trigger): Optional. Default load. Or trigger computation.
+        pose_estimation_output_dir ( varchar(255) ): Optional. Output dir relative to
+                                                     get_dlc_root_data_dir.
+        pose_estimation_params (longblob): Optional. Params for DLC's analyze_videos
+                                           params, if not default."""
+
+    definition = """
+    -> VideoRecordingNew                        # Session -> Scan -> Recording + File part table
+    -> Model                                    # Must specify a DLC project_path
+    ---
+    task_mode='load' : enum('load', 'trigger')  # load results or trigger computation
+    pose_estimation_output_dir='': varchar(255) # output dir relative to the root dir
+    pose_estimation_params=null  : longblob     # analyze_videos params, if not default
+    """
+
+    @classmethod
+    def infer_output_dir(cls, key: dict, relative: bool = False, mkdir: bool = False):
+        """Return the expected pose_estimation_output_dir.
+
+        Spaces in model name are replaced with hyphens.
+        Based on convention: / video_dir / Device_{}_Recording_{}_Model_{}
+
+        Args:
+            key: DataJoint key specifying a pairing of VideoRecordingNew and Model.
+            relative (bool): Report directory relative to get_dlc_processed_data_dir().
+            mkdir (bool): Default False. Make directory if it doesn't exist.
+        """
+        video_filepath = find_full_path(
+            get_dlc_root_data_dir(),
+            (VideoRecordingNew.File & key).fetch("file_path", limit=1)[0],
+        )
+        # root_dir = find_root_directory(get_dlc_root_data_dir(), video_filepath.parent)
+        root_dir = video_filepath.parent #TR23: rtoot dir is session_scan folder
+        recording_key = VideoRecordingNew & key
+        device = "-".join(
+            str(v)
+            for v in (_linking_module.equipment.Device & recording_key).fetch1("KEY").values() #TR23: linking to our camera table - not the scanner table
+        )
+        if get_dlc_processed_data_dir():
+            processed_dir = Path(get_dlc_processed_data_dir())
+        else:  # if processed not provided, default to where video is
+            processed_dir = root_dir
+
+        output_dir = (
+            processed_dir
+            / video_filepath.parent.relative_to(root_dir)
+            / (
+                f'device_{device}_recording_{key["recording_id"]}_model_'
+                + key["model_name"].replace(" ", "-")
+            )
+        )
+        if mkdir:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        return output_dir.relative_to(processed_dir) if relative else output_dir
+
+    @classmethod
+    def generate(
+        cls,
+        video_recording_key: dict,
+        model_name: str,
+        *,
+        task_mode: str = None,
+        analyze_videos_params: dict = None,
+    ):
+        """Insert PoseEstimationTask in inferred output dir.
+
+        Based on the convention / video_dir / device_{}_recording_{}_model_{}
+
+        Args:
+            video_recording_key (dict): DataJoint key specifying a VideoRecording.
+
+            model_name (str): Name of DLC model (from Model table) to be used for inference.
+            task_mode (str): Default 'trigger' computation. Or 'load' existing results.
+            analyze_videos_params (dict): Optional. Parameters passed to DLC's analyze_videos:
+                videotype, gputouse, save_as_csv, batchsize, cropping, TFGPUinference,
+                dynamic, robust_nframes, allow_growth, use_shelve
+        """
+        processed_dir = get_dlc_processed_data_dir()
+        output_dir = cls.infer_output_dir(
+            {**video_recording_key, "model_name": model_name},
+            relative=False,
+            mkdir=True,
         )
 
         if task_mode is None:
@@ -791,6 +1004,141 @@ class PoseEstimation(dj.Computed):
             df = pd.concat([df, frame], axis=1)
         return df
 
+@schema
+class PoseEstimationNew(dj.Computed):
+    """Results of pose estimation.
+
+    Attributes:
+        PoseEstimationTaskNew (foreign key): Pose Estimation Task key.
+        post_estimation_time (datetime): time of generation of this set of DLC results.
+    """
+
+    definition = """
+    -> PoseEstimationTaskNew
+    ---
+    pose_estimation_time: datetime  # time of generation of this set of DLC results
+    """
+
+    class BodyPartPosition(dj.Part):
+        """Position of individual body parts by frame index
+
+        Attributes:
+            PoseEstimationNew (foreign key): Pose Estimation key.
+            Model.BodyPart (foreign key): Body Part key.
+            frame_index (longblob): Frame index in model.
+            x_pos (longblob): X position.
+            y_pos (longblob): Y position.
+            z_pos (longblob): Optional. Z position.
+            likelihood (longblob): Model confidence."""
+
+        definition = """ # uses DeepLabCut h5 output for body part position
+        -> master
+        -> Model.BodyPart
+        ---
+        frame_index : longblob     # frame index in model
+        x_pos       : longblob
+        y_pos       : longblob
+        z_pos=null  : longblob
+        likelihood  : longblob
+        """
+
+    def make(self, key):
+        """.populate() method will launch training for each PoseEstimationTask"""
+        # ID model and directories
+        dlc_model = (Model & key).fetch1()
+        print(dlc_model)
+        print(key)
+        task_mode, output_dir = (PoseEstimationTaskNew & key).fetch1(
+            "task_mode", "pose_estimation_output_dir"
+        )
+
+        output_dir = find_full_path(get_dlc_root_data_dir(), output_dir)
+
+        # Triger PoseEstimation
+        if task_mode == "trigger":
+            # Triggering dlc for pose estimation required:
+            # - project_path: full path to the directory containing the trained model
+            # - video_filepaths: full paths to the video files for inference
+            # - analyze_video_params: optional parameters to analyze video
+            project_path = find_full_path(
+                get_dlc_root_data_dir(), dlc_model["project_path"]
+            )
+            video_filepaths = [
+                find_full_path(get_dlc_root_data_dir(), fp).as_posix()
+                for fp in (VideoRecordingNew.File & key).fetch("file_path")
+            ]
+            print(video_filepaths)
+            analyze_video_params = (PoseEstimationTaskNew & key).fetch1(
+                "pose_estimation_params"
+            ) or {}
+
+            dlc_reader.do_pose_estimation(
+                key,
+                video_filepaths,
+                dlc_model,
+                project_path,
+                output_dir,
+                **analyze_video_params,
+            )
+
+        dlc_result = dlc_reader.PoseEstimation(output_dir)
+        creation_time = datetime.fromtimestamp(dlc_result.creation_time).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+        body_parts = [
+            {
+                **key,
+                "body_part": k,
+                "frame_index": np.arange(dlc_result.nframes),
+                "x_pos": v["x"],
+                "y_pos": v["y"],
+                "z_pos": v.get("z"),
+                "likelihood": v["likelihood"],
+            }
+            for k, v in dlc_result.data.items()
+        ]
+
+        self.insert1({**key, "pose_estimation_time": creation_time})
+        self.BodyPartPosition.insert(body_parts)
+
+    @classmethod
+    def get_trajectory(cls, key: dict, body_parts: list = "all") -> pd.DataFrame:
+        """Returns a pandas dataframe of coordinates of the specified body_part(s)
+
+        Args:
+            key (dict): A DataJoint query specifying one PoseEstimation entry.
+            body_parts (list, optional): Body parts as a list. If "all", all joints
+
+        Returns:
+            df: multi index pandas dataframe with DLC scorer names, body_parts
+                and x/y coordinates of each joint name for a camera_id, similar to
+                 output of DLC dataframe. If 2D, z is set of zeros
+        """
+        model_name = key["model_name"]
+
+        if body_parts == "all":
+            body_parts = (cls.BodyPartPosition & key).fetch("body_part")
+        elif not isinstance(body_parts, list):
+            body_parts = list(body_parts)
+
+        df = None
+        for body_part in body_parts:
+            x_pos, y_pos, z_pos, likelihood = (
+                cls.BodyPartPosition & key & {"body_part": body_part} #TR23: added key restraint!
+            ).fetch1("x_pos", "y_pos", "z_pos", "likelihood")
+            if not z_pos:
+                z_pos = np.zeros_like(x_pos)
+
+            a = np.vstack((x_pos, y_pos, z_pos, likelihood))
+            a = a.T
+            pdindex = pd.MultiIndex.from_product(
+                [[model_name], [body_part], ["x", "y", "z", "likelihood"]],
+                names=["scorer", "bodyparts", "coords"],
+            )
+            frame = pd.DataFrame(a, columns=pdindex, index=range(0, a.shape[0]))
+            df = pd.concat([df, frame], axis=1)
+        return df
 
 def str_to_bool(value) -> bool:
     """Return whether the provided string represents true. Otherwise false.
