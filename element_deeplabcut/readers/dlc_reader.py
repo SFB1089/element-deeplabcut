@@ -329,7 +329,7 @@ def do_pose_estimation(
     """
     from deeplabcut.pose_estimation_tensorflow import analyze_videos
 
-    # ---- Build and save DLC configuration (yaml) file ----
+    # ---- Build and save DLC configuration (yaml) file ---- TR24: changed model.RecordingInfo to model.RecordingInfoNew
     dlc_config = dlc_model["config_template"]
     dlc_project_path = Path(project_path)
     dlc_config["project_path"] = dlc_project_path.as_posix()
@@ -338,7 +338,7 @@ def do_pose_estimation(
     for video_filepath in video_filepaths:
         if video_filepath not in dlc_config["video_sets"]:
             try:
-                px_width, px_height = (model.RecordingInfo & key).fetch1(
+                px_width, px_height = (model.RecordingInfoNew & key).fetch1(
                     "px_width", "px_height"
                 )
             except DataJointError:
