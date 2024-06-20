@@ -964,7 +964,17 @@ class PoseEstimation(dj.Computed):
         ]
 
         self.insert1({**key, "pose_estimation_time": creation_time})
-        self.BodyPartPosition.insert(body_parts)
+
+        # TR24: Split body_parts into two chunks to prevent database connection issues
+        mid_index = len(body_parts) // 2
+        chunk1 = body_parts[:mid_index]
+        chunk2 = body_parts[mid_index:]
+
+        # Insert the chunks separately
+        self.BodyPartPosition.insert(chunk1)
+        self.BodyPartPosition.insert(chunk2)
+                
+        # self.BodyPartPosition.insert(body_parts)
 
     @classmethod
     def get_trajectory(cls, key: dict, body_parts: list = "all") -> pd.DataFrame:
