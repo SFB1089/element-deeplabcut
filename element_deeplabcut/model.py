@@ -180,6 +180,40 @@ class VideoRecordingNew(dj.Manual):
         """
 
 @schema
+class DLCliveRecording(dj.Manual):
+    """Set of DLCLive Bonsai recordings with DLC inferences.
+
+    Attributes:
+        Session (foreign key): Session primary key (inherited via scan.Scan)
+        Scan (foreign key): Scan primary key.
+        recording_id (vartchar(44)): Unique recording ID. Construct from scan_id and Camera
+        Device (foreign key): Device table primary key, used for default output
+            directory path information.
+    """
+
+    definition = """
+    -> Scan
+    recording_id: varchar(44) 
+    ---
+    -> equipment.Device
+    """
+
+    class File(dj.Part):
+        """File IDs and paths associated with a given recording_id
+
+        Attributes:
+            DLCliveRecording (foreign key): Video recording primary key.
+            file_path ( varchar(255) ): file path of csv tracking, relative to root data dir.
+        """
+
+        definition = """
+        -> master
+        file_id: int
+        ---
+        file_path: varchar(255)  # filepath of trackin csv, relative to root data directory
+        """
+
+@schema
 class RecordingInfo(dj.Imported):
     """Automated table with video file metadata.
 
@@ -346,6 +380,7 @@ class BodyPart(dj.Lookup):
             print(f"Existing body parts: {tracked_body_parts}")
             print(f"New body parts: {new_body_parts}")
         return new_body_parts
+    
 
     @classmethod
     def insert_from_config(
@@ -757,6 +792,28 @@ class PoseEstimationTask(dj.Manual):
     insert_estimation_task = generate
 
 @schema
+class DLCLivePoseEstimationTask(dj.Manual):
+    """Staging table for pairing of video recording and model before inference.
+
+    Attributes:
+        VideoRecordingNew (foreign key): Video recording key.
+        Model (foreign key): Model name.
+        task_mode (load or trigger): Optional. Default load. Or trigger computation.
+        pose_estimation_output_dir ( varchar(255) ): Optional. Output dir relative to
+                                                     get_dlc_root_data_dir.
+        pose_estimation_params (longblob): Optional. Params for DLC's analyze_videos
+                                           params, if not default."""
+
+    definition = """
+    -> DLCliveRecording                         # Session -> Scan -> Recording + File part table
+    -> Model                                    # Must specify a DLC project_path
+    ---
+    task_mode='load' : enum('load', 'trigger')  # load results or trigger computation
+    pose_estimation_output_dir='': varchar(255) # output dir relative to the root dir
+    pose_estimation_params=null  : longblob     # analyze_videos params, if not default
+    """
+
+@schema
 class PoseEstimationTaskNew(dj.Manual):
     """Staging table for pairing of video recording and model before inference.
 
@@ -945,7 +1002,7 @@ class PoseEstimation(dj.Computed):
                 **analyze_video_params,
             )
 
-        dlc_result = dlc_reader.PoseEstimation(output_dir)
+        dlc_result = dlc_reader.PoseEstimation(output_dir) 
         creation_time = datetime.fromtimestamp(dlc_result.creation_time).strftime(
             "%Y-%m-%d %H:%M:%S"
         )
@@ -973,7 +1030,162 @@ class PoseEstimation(dj.Computed):
         # Insert the chunks separately
         self.BodyPartPosition.insert(chunk1)
         self.BodyPartPosition.insert(chunk2)
-                
+        
+
+        # self.BodyPartPosition.insert(body_parts)
+
+    @classmethod
+    def get_trajectory(cls, key: dict, body_parts: list = "all") -> pd.DataFrame:
+        """Returns a pandas dataframe of coordinates of the specified body_part(s)
+
+        Args:
+            key (dict): A DataJoint query specifying one PoseEstimation entry.
+            body_parts (list, optional): Body parts as a list. If "all", all joints
+
+        Returns:
+            df: multi index pandas dataframe with DLC scorer names, body_parts
+                and x/y coordinates of each joint name for a camera_id, similar to
+                 output of DLC dataframe. If 2D, z is set of zeros
+        """
+        model_name = key["model_name"]
+
+        if body_parts == "all":
+            body_parts = (cls.BodyPartPosition & key).fetch("body_part")
+        elif not isinstance(body_parts, list):
+            body_parts = list(body_parts)
+
+        df = None
+        for body_part in body_parts:
+            x_pos, y_pos, z_pos, likelihood = (
+                cls.BodyPartPosition & key & {"body_part": body_part} #TR23: added key restraint!
+            ).fetch1("x_pos", "y_pos", "z_pos", "likelihood")
+            if not z_pos:
+                z_pos = np.zeros_like(x_pos)
+
+            a = np.vstack((x_pos, y_pos, z_pos, likelihood))
+            a = a.T
+            pdindex = pd.MultiIndex.from_product(
+                [[model_name], [body_part], ["x", "y", "z", "likelihood"]],
+                names=["scorer", "bodyparts", "coords"],
+            )
+            frame = pd.DataFrame(a, columns=pdindex, index=range(0, a.shape[0]))
+            df = pd.concat([df, frame], axis=1)
+        return df
+@schema
+class DLCLivePoseEstimation(dj.Computed):
+    """Results of pose estimation.
+
+    Attributes:
+        PoseEstimationTask (foreign key): Pose Estimation Task key.
+        post_estimation_time (datetime): time of generation of this set of DLC results.
+    """
+
+    definition = """
+    -> DLCLivePoseEstimationTask
+    ---
+    pose_estimation_time: datetime  # time of generation of this set of DLC results
+    """
+
+    class BodyPartPosition(dj.Part):
+        """Position of individual body parts by frame index
+
+        Attributes:
+            DLCLivePoseEstimation (foreign key): Pose Estimation key.
+            Model.BodyPart (foreign key): Body Part key.
+            frame_index (longblob): Frame index in model.
+            x_pos (longblob): X position.
+            y_pos (longblob): Y position.
+            z_pos (longblob): Optional. Z position.
+            likelihood (longblob): Model confidence."""
+
+        definition = """ # uses DeepLabCut h5 output for body part position
+        -> master
+        -> Model.BodyPart
+        ---
+        frame_index : longblob     # frame index in model
+        x_pos       : longblob
+        y_pos       : longblob
+        z_pos=null  : longblob
+        likelihood  : longblob
+        """
+
+    def make(self, key):
+        """.populate() method will launch training for each PoseEstimationTask"""
+        # # ID model and directories
+        # dlc_model = (Model & key).fetch1()
+        # task_mode, output_dir = (DLCLivePoseEstimationTask & key).fetch1(
+        #     "task_mode", "pose_estimation_output_dir"
+        # )
+
+        DLCLive_csv = (DLCliveRecording.File & key).fetch1('file_path')
+
+        # Load the CSV file
+        df = pd.read_csv(DLCLive_csv)
+
+        creation_time = df.iloc[0, 0] 
+        creation_time = creation_time[:19].replace('T', ' ')
+
+        # Discard the first three columns
+        df = df.drop(df.columns[[0, 1, ]], axis=1)
+
+        # Assuming the CSV has a repeating pattern of x, y, body_part, confidence for each body part
+        # Calculate the number of body parts (assuming each body part has 4 columns: x, y, body_part, confidence)
+        num_body_parts = int(len(df.columns) / 4)
+
+        # Process the DataFrame
+        for i in range(num_body_parts):
+            x_col = df.columns[i * 4]
+            y_col = df.columns[i * 4 + 1]
+            body_part_col = df.iloc[0, i * 4 + 2]  # Assuming the first row contains body part names
+            confidence_col = df.columns[i * 4 + 3]
+            
+            # Rename columns
+            df.rename(columns={x_col: f'{body_part_col}_x', y_col: f'{body_part_col}_y', confidence_col: f'{body_part_col}_confidence'}, inplace=True)
+
+        # Drop the body part name columns as they are now redundant
+        df = df.drop(df.columns[2::4], axis=1)
+
+
+        # Assuming df is your DataFrame after processing
+        # Initialize an empty list to store the body part dictionaries
+        body_parts = []
+
+        # Assuming 'frame_index' is a column in df or can be derived
+        frame_index = np.arange(len(df))
+
+        # Iterate over the number of body parts to construct the dictionary
+        for i in range(num_body_parts):
+            body_part = "_".join(df.columns[i * 3].split('_')[:-1])  # Extract body part name from the column name
+            x_pos = df[f'{body_part}_x'].values
+            y_pos = df[f'{body_part}_y'].values
+            likelihood = df[f'{body_part}_confidence'].values
+            
+            # Construct the dictionary for the current body part
+            body_part_dict = {
+                **key,
+                "body_part": body_part,
+                "frame_index": frame_index,
+                "x_pos": x_pos,
+                "y_pos": y_pos,
+                "likelihood": likelihood,
+            }
+            
+            # Append the dictionary to the list
+            body_parts.append(body_part_dict)
+
+        self.insert1({**key, "pose_estimation_time": creation_time})
+        self.BodyPartPosition.insert(body_parts)
+        
+        # # TR24: Split body_parts into two chunks to prevent database connection issues
+        # mid_index = len(body_parts) // 2
+        # chunk1 = body_parts[:mid_index]
+        # chunk2 = body_parts[mid_index:]
+
+        # # Insert the chunks separately
+        # self.BodyPartPosition.insert(chunk1)
+        # self.BodyPartPosition.insert(chunk2)
+        
+
         # self.BodyPartPosition.insert(body_parts)
 
     @classmethod
@@ -1110,7 +1322,17 @@ class PoseEstimationNew(dj.Computed):
         ]
 
         self.insert1({**key, "pose_estimation_time": creation_time})
-        self.BodyPartPosition.insert(body_parts)
+        # self.BodyPartPosition.insert(body_parts)
+
+        # # Determine chunk size based on length of data and chunkfactor
+        total_length = len(body_parts)
+        chunkfactor = 2
+        chunk_size = max(1, total_length // chunkfactor)  # Ensure chunk_size is at least 1
+
+        # Chunked insertion for body_parts
+        for i in range(0, total_length, chunk_size):
+            self.BodyPartPosition.insert(body_parts[i:i + chunk_size])
+
 
     @classmethod
     def get_trajectory(cls, key: dict, body_parts: list = "all") -> pd.DataFrame:
