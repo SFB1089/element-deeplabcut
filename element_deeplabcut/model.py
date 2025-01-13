@@ -18,6 +18,10 @@ from datetime import datetime
 from element_interface.utils import find_full_path, find_root_directory
 from .readers import dlc_reader
 
+#TR 2024
+import GPUtil
+import random
+
 schema = dj.schema()
 _linking_module = None
 
@@ -1294,6 +1298,18 @@ class PoseEstimationNew(dj.Computed):
                 "pose_estimation_params"
             ) or {}
 
+            # TR2024
+            # Modify analyze_video_params
+            # find GPU with no load
+            selected_gpu = select_gpu()
+
+            # Ensure 'TFGPUinference' is True and update the GPU selection
+            analyze_video_params.update({
+                'gputouse': selected_gpu,
+                'TFGPUinference': True})  # Set to True by default          
+            
+            print(analyze_video_params)
+            
             dlc_reader.do_pose_estimation(
                 key,
                 video_filepaths,
