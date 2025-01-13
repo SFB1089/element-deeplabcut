@@ -264,7 +264,7 @@ def do_pose_estimation(
     TFGPUinference=True,
     dynamic=(False, 0.5, 10),
     robust_nframes=False,
-    allow_growth=False,
+    allow_growth=True,
     use_shelve=False,
 ):
     """Launch DLC's analyze_videos within element-deeplabcut.
