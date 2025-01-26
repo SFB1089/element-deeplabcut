@@ -76,6 +76,24 @@ def activate(
     )
 
 
+# -------------- function for GPU server use! TR2024
+
+# Step 1: Check available GPUs and their loads
+def select_gpu():
+    # Get all GPUs and their usage status
+    gpus = GPUtil.getGPUs()
+    available_gpus = [gpu.id for gpu in gpus if gpu.load == 0]
+
+    # Step 2: Select a GPU
+    if available_gpus:
+        # Randomly select a GPU with no load
+        selected_gpu = random.choice(available_gpus)
+    else:
+        # If all GPUs are under load, default to GPU 0
+        selected_gpu = 0
+
+    return selected_gpu
+
 # -------------- Functions required by element-deeplabcut ---------------
 
 
